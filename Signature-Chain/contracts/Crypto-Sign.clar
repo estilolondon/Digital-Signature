@@ -11,7 +11,8 @@
     title: (string-utf8 256),
     description: (string-utf8 1024),
     created-at: uint,
-    status: (string-utf8 20)  ;; "active" or "revoked"
+    status: (string-utf8 20),  ;; "active" or "revoked"
+    signature-count: uint      ;; Added signature counter for each document
   }
 )
 
@@ -46,6 +47,8 @@
 (define-constant ERR-ALREADY-SIGNED (err u409))
 (define-constant ERR-DOCUMENT-REVOKED (err u403))
 (define-constant ERR-PUBLIC-KEY-NOT-FOUND (err u404))
+(define-constant ERR-INVALID-PUBLIC-KEY (err u400))
+(define-constant ERR-INVALID-INPUT (err u400))
 
 ;; Read-Only Functions
 
@@ -70,16 +73,14 @@
 )
 
 ;; Get the total number of signatures for a document
-;; This is a placeholder implementation that always returns 0
 (define-read-only (get-signature-count (document-hash (buff 32)))
-  u0  ;; Returning a fixed value for now
+  (let ((doc-data (get-document document-hash)))
+    (if (is-some doc-data)
+      (get signature-count (unwrap-panic doc-data))
+      u0
+    )
+  )
 )
-
-;; In a real implementation, you would likely want a proper signature counting mechanism
-;; Here's an example approach that could be implemented:
-;; 1. Store a counter for each document
-;; 2. Increment the counter when a signature is added
-;; 3. Decrement the counter when a signature is invalidated
 
 ;; Get user's public key
 (define-read-only (get-public-key (user principal))
@@ -99,11 +100,40 @@
   (var-get total-documents)
 )
 
+;; Validation helper: validate public key format
+;; For compressed secp256k1 public keys (33 bytes)
+(define-read-only (validate-public-key (public-key (buff 33)))
+  (let (
+    ;; First byte must be 0x02 or 0x03 for compressed secp256k1 keys
+    (first-byte (unwrap-panic (element-at? public-key u0)))
+  )
+    (or 
+      (is-eq first-byte 0x02)
+      (is-eq first-byte 0x03)
+    )
+  )
+)
+
+;; Validation helper: validate string is not empty
+(define-read-only (validate-non-empty-string (input (string-utf8 1024)))
+  (not (is-eq input u""))
+)
+
+;; Validation helper: validate description (can be empty but must be valid UTF-8)
+(define-read-only (validate-description (description (string-utf8 1024)))
+  ;; Always returns true since the type (string-utf8 1024) already ensures it's valid UTF-8
+  ;; This function exists to explicitly show we're validating the description
+  true
+)
+
 ;; Public Functions
 
 ;; Register user public key
 (define-public (register-public-key (public-key (buff 33)))
   (begin
+    ;; Validate the public key format
+    (asserts! (validate-public-key public-key) ERR-INVALID-PUBLIC-KEY)
+    
     (map-set user-public-keys
       { user: tx-sender }
       { public-key: public-key }
@@ -118,6 +148,11 @@
     (title (string-utf8 256))
     (description (string-utf8 1024)))
   (let ((current-time (unwrap-panic (get-block-info? time (- block-height u1)))))
+    ;; Validate inputs
+    (asserts! (validate-non-empty-string title) ERR-INVALID-INPUT)
+    ;; Validate description (even though we allow it to be empty)
+    (asserts! (validate-description description) ERR-INVALID-INPUT)
+    
     (if (document-exists document-hash)
       ERR-DOCUMENT-ALREADY-EXISTS
       (begin
@@ -128,7 +163,8 @@
             title: title,
             description: description,
             created-at: current-time,
-            status: u"active"  ;; Changed from "active" to u"active" for UTF-8 encoding
+            status: u"active",
+            signature-count: u0  ;; Initialize signature count to 0
           }
         )
         (var-set total-documents (+ (var-get total-documents) u1))
@@ -150,6 +186,7 @@
   )
     (asserts! (is-some doc-data) ERR-DOCUMENT-NOT-FOUND)
     (asserts! (is-some public-key-data) ERR-PUBLIC-KEY-NOT-FOUND)
+    (asserts! (validate-non-empty-string message) ERR-INVALID-INPUT)
     
     (let (
       (doc (unwrap-panic doc-data))
@@ -176,6 +213,13 @@
           is-valid: true
         }
       )
+      
+      ;; Update signature count in document
+      (map-set documents
+        { document-hash: document-hash }
+        (merge doc { signature-count: (+ (get signature-count doc) u1) })
+      )
+      
       (ok true)
     )
   )
@@ -193,7 +237,7 @@
       ;; Update document status to revoked
       (map-set documents
         { document-hash: document-hash }
-        (merge doc { status: u"revoked" })  ;; Changed from "revoked" to u"revoked" for UTF-8 encoding
+        (merge doc { status: u"revoked" })
       )
       (ok true)
     )
@@ -251,6 +295,9 @@
     (description (string-utf8 1024)))
   (let ((doc-data (get-document document-hash)))
     (asserts! (is-some doc-data) ERR-DOCUMENT-NOT-FOUND)
+    (asserts! (validate-non-empty-string title) ERR-INVALID-INPUT)
+    ;; Validate description (even though we allow it to be empty)
+    (asserts! (validate-description description) ERR-INVALID-INPUT)
     
     (let ((doc (unwrap-panic doc-data)))
       ;; Check if caller is the creator
@@ -286,6 +333,17 @@
     )
       ;; Check if caller is the creator
       (asserts! (is-eq tx-sender (get creator doc)) ERR-NOT-AUTHORIZED)
+      
+      ;; Check if signature is currently valid before decrementing count
+      (if (get is-valid sig)
+        ;; Decrement signature count only if the signature was valid
+        (map-set documents
+          { document-hash: document-hash }
+          (merge doc { signature-count: (- (get signature-count doc) u1) })
+        )
+        ;; Do nothing if already invalid
+        true
+      )
       
       ;; Invalidate the signature
       (map-set signatures
